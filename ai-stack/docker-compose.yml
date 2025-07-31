@@ -74,9 +74,9 @@ volumes:
       - "ai-stack.type=integration"
 
 services:
-  # PostgreSQL Database
+  # PostgreSQL Database with Vector Extensions
   postgres:
-    image: postgres:17.2-alpine
+    image: pgvector/pgvector:pg17
     container_name: ai-postgres
     restart: unless-stopped
     environment:

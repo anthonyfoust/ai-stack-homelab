@@ -1,0 +1,25 @@
+# Environment files with secrets
+.env
+.env.local
+.env.production
+
+# Data directories
+data/
+logs/
+backups/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+
+# Docker overrides (keep template)
+docker-compose.override.yml
+
+# Backup files
+*.backup
+*.sql.gz

@@ -97,10 +97,12 @@ nano .env
 - **Features**: Load balancing, rate limiting, cost tracking
 - **Authentication**: Master key required
 
-### 🐘 PostgreSQL Database
+### 🐘 PostgreSQL Database (AI-Enhanced)
 - **Port**: 5432 (internal)
-- **Purpose**: Persistent storage for n8n, LiteLLM
+- **Purpose**: Persistent storage for n8n, LiteLLM with AI capabilities
 - **Databases**: aistack_production, n8n_prod, litellm_prod
+- **Extensions**: pgvector (embeddings), pgai (AI workflows)
+- **Features**: Vector similarity search, embedding storage, RAG support
 - **Backup**: Automated daily backups
 
 ### 🔴 Redis Cache
