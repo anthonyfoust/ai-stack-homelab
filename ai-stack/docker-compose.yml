@@ -1,131 +1,372 @@
 name: ai-stack
 
-# Network definitions with proper segmentation
 networks:
-  # Public-facing services (accessible from host)
-  frontend:
+  # AI services network
+  ai-network:
     driver: bridge
     internal: false
     ipam:
-      driver: default
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 172.22.0.0/16
+      driver: default
   
   # Backend services (internal communication only)
   backend:
     driver: bridge
     internal: true
     ipam:
-      driver: default
       config:
         - subnet: 172.21.0.0/16
+      driver: default
   
-  # AI services network
-  ai-network:
+  # Public-facing services (accessible from host)
+  frontend:
     driver: bridge
     internal: false
     ipam:
-      driver: default
       config:
-        - subnet: 172.22.0.0/16
-
-# Volume definitions with proper labeling
-volumes:
-  postgres_data:
-    driver: local
-    labels:
-      - "ai-stack.service=postgres"
-      - "ai-stack.type=database"
-  
-  n8n_data:
-    driver: local
-    labels:
-      - "ai-stack.service=n8n"
-      - "ai-stack.type=workflow"
-  
-  ollama_data:
-    driver: local
-    labels:
-      - "ai-stack.service=ollama"
-      - "ai-stack.type=ai-models"
-  
-  webui_data:
-    driver: local
-    labels:
-      - "ai-stack.service=webui"
-      - "ai-stack.type=application"
-  
-  litellm_data:
-    driver: local
-    labels:
-      - "ai-stack.service=litellm"
-      - "ai-stack.type=ai-proxy"
-  
-  redis_data:
-    driver: local
-    labels:
-      - "ai-stack.service=redis"
-      - "ai-stack.type=cache"
-  
-  mcp_data:
-    driver: local
-    labels:
-      - "ai-stack.service=mcp"
-      - "ai-stack.type=integration"
+        - subnet: 172.20.0.0/16
+      driver: default
 
 services:
+  # LiteLLM Proxy
+  litellm:
+    container_name: ai-litellm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${LITELLM_CPU_LIMIT:-1.0}'
+          memory: ${LITELLM_MEMORY_LIMIT:-1G}
+        reservations:
+          cpus: '${LITELLM_CPU_RESERVATION:-0.25}'
+          memory: ${LITELLM_MEMORY_RESERVATION:-256M}
+    environment:
+      ADD_FUNCTION_TO_PROMPT: true
+      DATABASE_TYPE: postgres
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DROP_PARAMS: true
+      LITELLM_LOG: ${LITELLM_LOG_LEVEL:-INFO}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      MODEL_LIST: ${LITELLM_MODEL_LIST:-}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_PORT: 6379
+      STORE_MODEL_IN_DB: "True"
+      UI_PASSWORD: ${LITELLM_UI_PASSWORD}
+      UI_USERNAME: ${LITELLM_UI_USERNAME:-admin}
+      
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 40s
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
+      timeout: 10s
+    image: ghcr.io/berriai/litellm:${LITELLM_VERSION:-main-stable}
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "10m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.60
+      backend:
+        ipv4_address: 172.21.0.60
+      frontend:
+        ipv4_address: 172.20.0.60
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - litellm_data:/app/proxy_server_config
+      - ./configs/litellm:/app/config:ro
+
+  # MCPO (MCP Orchestrator)
+  mcpo:
+    command: ["mcpo", "--host", "0.0.0.0", "--port", "8000", "--config", "/app/config/config.json"]
+    container_name: ai-mcpo
+    depends_on:
+      n8n-mcp:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${MCPO_CPU_LIMIT:-0.25}'
+          memory: ${MCPO_MEMORY_LIMIT:-256M}
+        reservations:
+          cpus: '${MCPO_CPU_RESERVATION:-0.1}'
+          memory: ${MCPO_MEMORY_RESERVATION:-64M}
+    environment:
+      # Core Configuration
+      LOG_LEVEL: ${MCPO_LOG_LEVEL:-info}
+      MCPO_API_KEY: ${MCPO_API_KEY}
+      MCPO_SERVER_TYPE: ${MCPO_SERVER_TYPE:-streamable_http}
+      NODE_ENV: production
+      TZ: ${TIMEZONE:-UTC}
+      
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 30s
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      timeout: 10s
+    image: ghcr.io/open-webui/mcpo:${MCPO_VERSION:-main}
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "5m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.80
+      backend:
+        ipv4_address: 172.21.0.80
+    ports:
+      - "${MCPO_PORT:-8000}:8000"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./configs/mcp/config.json:/app/config/config.json:ro
+
+  # n8n Workflow Automation
+  n8n:
+    container_name: ai-n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${N8N_CPU_LIMIT:-2.0}'
+          memory: ${N8N_MEMORY_LIMIT:-3G}
+        reservations:
+          cpus: '${N8N_CPU_RESERVATION:-0.5}'
+          memory: ${N8N_MEMORY_RESERVATION:-1G}
+    environment:
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_SCHEMA: ${N8N_DB_SCHEMA:-n8n}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_TYPE: postgresdb
+      GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
+      N8N_AI_ENABLED: ${N8N_AI_ENABLED:-true}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
+      N8N_METRICS: ${N8N_METRICS:-true}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      N8N_PUBLIC_API_DISABLED: ${N8N_PUBLIC_API_DISABLED:-false}
+      N8N_RUNNERS_ENABLED: ${N8N_RUNNERS_ENABLED:-true}
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
+      N8N_USER_MANAGEMENT_DISABLED: ${N8N_USER_MANAGEMENT_DISABLED:-false}
+      N8N_VERSION_NOTIFICATIONS_ENABLED: ${N8N_VERSION_NOTIFICATIONS_ENABLED:-false}
+      NODE_OPTIONS: "--max-old-space-size=${N8N_MAX_MEMORY:-2048}"
+      TZ: ${TIMEZONE:-UTC}
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
+      
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 45s
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5678/healthz"]
+      timeout: 10s
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "20m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.40
+      backend:
+        ipv4_address: 172.21.0.40
+      frontend:
+        ipv4_address: 172.20.0.40
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    user: node
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./configs/n8n:/etc/n8n:ro
+
+  # n8n MCP Server
+  n8n-mcp:
+    container_name: ai-n8n-mcp
+    depends_on:
+      n8n:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${N8N_MCP_CPU_LIMIT:-0.5}'
+          memory: ${N8N_MCP_MEMORY_LIMIT:-512M}
+        reservations:
+          cpus: '${N8N_MCP_CPU_RESERVATION:-0.1}'
+          memory: ${N8N_MCP_MEMORY_RESERVATION:-128M}
+    environment:
+      AUTH_TOKEN: ${N8N_MCP_AUTH_TOKEN}
+      DISABLE_CONSOLE_OUTPUT: ${N8N_MCP_DISABLE_CONSOLE:-true}
+      HOST: 0.0.0.0
+      LOG_LEVEL: ${N8N_MCP_LOG_LEVEL:-error}
+      MCP_MODE: ${MCP_MODE:-http}
+      N8N_API_KEY: ${N8N_API_KEY}
+      N8N_API_URL: http://n8n:5678
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 3000
+      TRUST_PROXY: ${TRUST_PROXY:-true}
+      TZ: ${TIMEZONE:-UTC}
+      USE_FIXED_HTTP: ${USE_FIXED_HTTP:-true}
+      
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 45s
+      test: ["CMD-SHELL", "pgrep -f 'node.*dist/mcp/index.js' || exit 1"]
+      timeout: 10s
+    image: ghcr.io/czlonkowski/n8n-mcp:${N8N_MCP_VERSION:-latest}
+    init: true
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "5m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.70
+      backend:
+        ipv4_address: 172.21.0.70
+    ports:
+      - "${N8N_MCP_PORT:-3000}:3000"
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    stdin_open: true
+    tmpfs:
+      - /tmp
+      - /var/log
+      - /app/logs
+    tty: true
+    volumes:
+      - mcp_data:/app/data
+      - ./configs/mcp:/app/config:ro
+
+  # Ollama AI Model Server
+  ollama:
+    container_name: ai-ollama
+    deploy:
+      resources:
+        limits:
+          cpus: '${OLLAMA_CPU_LIMIT:-6.0}'
+          memory: ${OLLAMA_MEMORY_LIMIT:-12G}
+        reservations:
+          cpus: '${OLLAMA_CPU_RESERVATION:-1.0}'
+          memory: ${OLLAMA_MEMORY_RESERVATION:-2G}
+    environment:
+      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-true}
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_MODELS:-3}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_PARALLEL:-2}
+      OLLAMA_ORIGINS: "*"
+    healthcheck:
+      interval: 30s
+      retries: 5
+      start_period: 60s
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
+      timeout: 10s
+    image: ollama/ollama:${OLLAMA_VERSION:-latest}
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "20m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.30
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./configs/ollama:/etc/ollama:ro
+
   # PostgreSQL Database with Vector Extensions
   postgres:
-    image: pgvector/pgvector:pg17
     container_name: ai-postgres
-    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '${POSTGRES_CPU_LIMIT:-2.0}'
+          memory: ${POSTGRES_MEMORY_LIMIT:-2G}
+        reservations:
+          cpus: '${POSTGRES_CPU_RESERVATION:-0.5}'
+          memory: ${POSTGRES_MEMORY_RESERVATION:-512M}
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_ADDITIONAL_DBS:-}
       PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./configs/postgres/init:/docker-entrypoint-initdb.d:ro
-      - ./configs/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      POSTGRES_MULTIPLE_DATABASES: ${POSTGRES_ADDITIONAL_DBS:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+    healthcheck:
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      timeout: 5s
+    image: pgvector/pgvector:pg17
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "10m"
     networks:
       backend:
         ipv4_address: 172.21.0.10
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
       - /var/run/postgresql
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    security_opt:
-      - no-new-privileges:true
     user: postgres
-    deploy:
-      resources:
-        limits:
-          memory: ${POSTGRES_MEMORY_LIMIT:-2G}
-          cpus: '${POSTGRES_CPU_LIMIT:-2.0}'
-        reservations:
-          memory: ${POSTGRES_MEMORY_RESERVATION:-512M}
-          cpus: '${POSTGRES_CPU_RESERVATION:-0.5}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./configs/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./configs/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
 
   # Redis Cache
   redis:
-    image: redis:7.4-alpine
-    container_name: ai-redis
-    restart: unless-stopped
     command: >
       redis-server
       --appendonly yes
@@ -135,424 +376,137 @@ services:
       --save 900 1
       --save 300 10
       --save 60 10000
+    container_name: ai-redis
+    deploy:
+      resources:
+        limits:
+          cpus: '${REDIS_CPU_LIMIT:-0.5}'
+          memory: ${REDIS_MEMORY_LIMIT:-512M}
+        reservations:
+          cpus: '${REDIS_CPU_RESERVATION:-0.1}'
+          memory: ${REDIS_MEMORY_RESERVATION:-128M}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 30s
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      timeout: 10s
+    image: redis:7.4-alpine
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "5m"
+    networks:
+      ai-network:
+        ipv4_address: 172.22.0.20
+      backend:
+        ipv4_address: 172.21.0.20
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - redis_data:/data
       - ./configs/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    networks:
-      backend:
-        ipv4_address: 172.21.0.20
-      ai-network:
-        ipv4_address: 172.22.0.20
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${REDIS_MEMORY_LIMIT:-512M}
-          cpus: '${REDIS_CPU_LIMIT:-0.5}'
-        reservations:
-          memory: ${REDIS_MEMORY_RESERVATION:-128M}
-          cpus: '${REDIS_CPU_RESERVATION:-0.1}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
-
-  # Ollama AI Model Server
-  ollama:
-    image: ollama/ollama:${OLLAMA_VERSION:-latest}
-    container_name: ai-ollama
-    restart: unless-stopped
-    environment:
-      OLLAMA_HOST: 0.0.0.0
-      OLLAMA_ORIGINS: "*"
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
-      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_MODELS:-3}
-      OLLAMA_NUM_PARALLEL: ${OLLAMA_PARALLEL:-2}
-      OLLAMA_FLASH_ATTENTION: ${OLLAMA_FLASH_ATTENTION:-true}
-    volumes:
-      - ollama_data:/root/.ollama
-      - ./configs/ollama:/etc/ollama:ro
-    networks:
-      ai-network:
-        ipv4_address: 172.22.0.30
-    ports:
-      - "${OLLAMA_PORT:-11434}:11434"
-    tmpfs:
-      - /tmp
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${OLLAMA_MEMORY_LIMIT:-12G}
-          cpus: '${OLLAMA_CPU_LIMIT:-6.0}'
-        reservations:
-          memory: ${OLLAMA_MEMORY_RESERVATION:-2G}
-          cpus: '${OLLAMA_CPU_RESERVATION:-1.0}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
-
-  # n8n Workflow Automation
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
-    container_name: ai-n8n
-    restart: unless-stopped
-    environment:
-      # Database Configuration
-      DB_TYPE: postgresdb
-      DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
-      DB_POSTGRESDB_USER: ${POSTGRES_USER}
-      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_POSTGRESDB_SCHEMA: ${N8N_DB_SCHEMA:-n8n}
-      
-      # Core Configuration
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE:-false}
-      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
-      N8N_HOST: ${N8N_HOST:-localhost}
-      N8N_PORT: 5678
-      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
-      
-      # Features Configuration
-      N8N_METRICS: ${N8N_METRICS:-true}
-      N8N_LOG_LEVEL: ${N8N_LOG_LEVEL:-info}
-      N8N_USER_MANAGEMENT_DISABLED: ${N8N_USER_MANAGEMENT_DISABLED:-false}
-      N8N_PUBLIC_API_DISABLED: ${N8N_PUBLIC_API_DISABLED:-false}
-      N8N_VERSION_NOTIFICATIONS_ENABLED: ${N8N_VERSION_NOTIFICATIONS_ENABLED:-false}
-      N8N_RUNNERS_ENABLED: ${N8N_RUNNERS_ENABLED:-true}
-      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
-      
-      # Integration Configuration
-      GENERIC_TIMEZONE: ${TIMEZONE:-UTC}
-      TZ: ${TIMEZONE:-UTC}
-      NODE_OPTIONS: "--max-old-space-size=${N8N_MAX_MEMORY:-2048}"
-      
-      # AI Integration
-      N8N_AI_ENABLED: ${N8N_AI_ENABLED:-true}
-      
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./configs/n8n:/etc/n8n:ro
-    networks:
-      backend:
-        ipv4_address: 172.21.0.40
-      frontend:
-        ipv4_address: 172.20.0.40
-      ai-network:
-        ipv4_address: 172.22.0.40
-    ports:
-      - "${N8N_PORT:-5678}:5678"
-    tmpfs:
-      - /tmp
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:5678/healthz"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 45s
-    security_opt:
-      - no-new-privileges:true
-    user: node
-    deploy:
-      resources:
-        limits:
-          memory: ${N8N_MEMORY_LIMIT:-3G}
-          cpus: '${N8N_CPU_LIMIT:-2.0}'
-        reservations:
-          memory: ${N8N_MEMORY_RESERVATION:-1G}
-          cpus: '${N8N_CPU_RESERVATION:-0.5}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "5"
 
   # Open WebUI
   webui:
-    image: ghcr.io/open-webui/open-webui:${WEBUI_VERSION:-main}
     container_name: ai-webui
-    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '${WEBUI_CPU_LIMIT:-1.0}'
+          memory: ${WEBUI_MEMORY_LIMIT:-1G}
+        reservations:
+          cpus: '${WEBUI_CPU_RESERVATION:-0.25}'
+          memory: ${WEBUI_MEMORY_RESERVATION:-256M}
     environment:
-      # Core Configuration
-      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
-      WEBUI_NAME: ${WEBUI_NAME:-AI Stack WebUI}
-      WEBUI_URL: ${WEBUI_URL:-http://localhost:8080}
-      
-      # AI Model Configuration
-      OLLAMA_BASE_URL: http://ollama:11434
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-200}
+      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE:-en-US}
       DEFAULT_MODELS: ${DEFAULT_MODELS:-}
       DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-user}
-      
-      # Authentication
+      ENABLE_IMAGE_GENERATION: ${ENABLE_IMAGE_GENERATION:-true}
+      ENABLE_RAG_WEB_SEARCH: ${ENABLE_RAG_WEB_SEARCH:-false}
       ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
-      WEBUI_AUTH: ${WEBUI_AUTH:-true}
-      DEFAULT_LOCALE: ${DEFAULT_LOCALE:-en-US}
-      
-      # RAG Configuration
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
+      OLLAMA_BASE_URL: http://ollama:11434
       RAG_EMBEDDING_ENGINE: ollama
       RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-nomic-embed-text}
-      CHUNK_SIZE: ${CHUNK_SIZE:-1000}
-      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-200}
-      
-      # Features
-      ENABLE_RAG_WEB_SEARCH: ${ENABLE_RAG_WEB_SEARCH:-false}
-      ENABLE_IMAGE_GENERATION: ${ENABLE_IMAGE_GENERATION:-true}
       SAFE_MODE: ${SAFE_MODE:-false}
+      WEBUI_AUTH: ${WEBUI_AUTH:-true}
+      WEBUI_NAME: ${WEBUI_NAME:-AI Stack WebUI}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_URL: ${WEBUI_URL:-http://localhost:8080}
       
-      # Integration
-      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
-      
-    volumes:
-      - webui_data:/app/backend/data
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 60s
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      timeout: 10s
+    image: ghcr.io/open-webui/open-webui:${WEBUI_VERSION:-main}
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "10m"
     networks:
-      frontend:
-        ipv4_address: 172.20.0.50
       ai-network:
         ipv4_address: 172.22.0.50
+      frontend:
+        ipv4_address: 172.20.0.50
     ports:
       - "${WEBUI_PORT:-8080}:8080"
     read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
     tmpfs:
       - /tmp
       - /app/backend/logs
       - /app/backend/static/cache
-    depends_on:
-      ollama:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${WEBUI_MEMORY_LIMIT:-1G}
-          cpus: '${WEBUI_CPU_LIMIT:-1.0}'
-        reservations:
-          memory: ${WEBUI_MEMORY_RESERVATION:-256M}
-          cpus: '${WEBUI_CPU_RESERVATION:-0.25}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # LiteLLM Proxy
-  litellm:
-    image: ghcr.io/berriai/litellm:${LITELLM_VERSION:-main-stable}
-    container_name: ai-litellm
-    restart: unless-stopped
-    environment:
-      # Database Configuration
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      DATABASE_TYPE: postgres
-      STORE_MODEL_IN_DB: "True"
-      
-      # Core Configuration
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
-      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
-      UI_USERNAME: ${LITELLM_UI_USERNAME:-admin}
-      UI_PASSWORD: ${LITELLM_UI_PASSWORD}
-      
-      # Redis Configuration
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-      
-      # Features
-      LITELLM_LOG: ${LITELLM_LOG_LEVEL:-INFO}
-      DROP_PARAMS: true
-      ADD_FUNCTION_TO_PROMPT: true
-      
-      # Model Configuration
-      MODEL_LIST: ${LITELLM_MODEL_LIST:-}
-      
     volumes:
-      - litellm_data:/app/proxy_server_config
-      - ./configs/litellm:/app/config:ro
-    networks:
-      backend:
-        ipv4_address: 172.21.0.60
-      ai-network:
-        ipv4_address: 172.22.0.60
-      frontend:
-        ipv4_address: 172.20.0.60
-    ports:
-      - "${LITELLM_PORT:-4000}:4000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health/liveliness"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${LITELLM_MEMORY_LIMIT:-1G}
-          cpus: '${LITELLM_CPU_LIMIT:-1.0}'
-        reservations:
-          memory: ${LITELLM_MEMORY_RESERVATION:-256M}
-          cpus: '${LITELLM_CPU_RESERVATION:-0.25}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - webui_data:/app/backend/data
 
-  # n8n MCP Server
-  n8n-mcp:
-    image: ghcr.io/czlonkowski/n8n-mcp:${N8N_MCP_VERSION:-latest}
-    container_name: ai-n8n-mcp
-    restart: unless-stopped
-    init: true
-    environment:
-      # Core Configuration
-      MCP_MODE: ${MCP_MODE:-http}
-      USE_FIXED_HTTP: ${USE_FIXED_HTTP:-true}
-      NODE_ENV: ${NODE_ENV:-production}
-      
-      # Authentication
-      AUTH_TOKEN: ${N8N_MCP_AUTH_TOKEN}
-      
-      # Logging
-      LOG_LEVEL: ${N8N_MCP_LOG_LEVEL:-error}
-      DISABLE_CONSOLE_OUTPUT: ${N8N_MCP_DISABLE_CONSOLE:-true}
-      
-      # n8n Integration
-      N8N_API_URL: http://n8n:5678
-      N8N_API_KEY: ${N8N_API_KEY}
-      
-      # Network Configuration
-      TZ: ${TIMEZONE:-UTC}
-      TRUST_PROXY: ${TRUST_PROXY:-true}
-      HOST: 0.0.0.0
-      PORT: 3000
-      
-    volumes:
-      - mcp_data:/app/data
-      - ./configs/mcp:/app/config:ro
-    networks:
-      backend:
-        ipv4_address: 172.21.0.70
-      ai-network:
-        ipv4_address: 172.22.0.70
-    ports:
-      - "${N8N_MCP_PORT:-3000}:3000"
-    read_only: true
-    tmpfs:
-      - /tmp
-      - /var/log
-      - /app/logs
-    stdin_open: true
-    tty: true
-    depends_on:
-      n8n:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'node.*dist/mcp/index.js' || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 45s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${N8N_MCP_MEMORY_LIMIT:-512M}
-          cpus: '${N8N_MCP_CPU_LIMIT:-0.5}'
-        reservations:
-          memory: ${N8N_MCP_MEMORY_RESERVATION:-128M}
-          cpus: '${N8N_MCP_CPU_RESERVATION:-0.1}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
-
-  # MCPO (MCP Orchestrator)
-  mcpo:
-    image: ghcr.io/open-webui/mcpo:${MCPO_VERSION:-main}
-    container_name: ai-mcpo
-    restart: unless-stopped
-    environment:
-      # Core Configuration
-      MCPO_API_KEY: ${MCPO_API_KEY}
-      MCPO_SERVER_TYPE: ${MCPO_SERVER_TYPE:-streamable_http}
-      NODE_ENV: production
-      LOG_LEVEL: ${MCPO_LOG_LEVEL:-info}
-      TZ: ${TIMEZONE:-UTC}
-      
-    volumes:
-      - ./configs/mcp/config.json:/app/config/config.json:ro
-    command: ["mcpo", "--host", "0.0.0.0", "--port", "8000", "--config", "/app/config/config.json"]
-    networks:
-      ai-network:
-        ipv4_address: 172.22.0.80
-      backend:
-        ipv4_address: 172.21.0.80
-    ports:
-      - "${MCPO_PORT:-8000}:8000"
-    tmpfs:
-      - /tmp
-    depends_on:
-      n8n-mcp:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          memory: ${MCPO_MEMORY_LIMIT:-256M}
-          cpus: '${MCPO_CPU_LIMIT:-0.25}'
-        reservations:
-          memory: ${MCPO_MEMORY_RESERVATION:-64M}
-          cpus: '${MCPO_CPU_RESERVATION:-0.1}'
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "5m"
-        max-file: "3"
+# Volume definitions with proper labeling
+volumes:
+  litellm_data:
+    labels:
+      - "ai-stack.service=litellm"
+      - "ai-stack.type=ai-proxy"
+  
+  mcp_data:
+    labels:
+      - "ai-stack.service=mcp"
+      - "ai-stack.type=integration"
+  
+  n8n_data:
+    labels:
+      - "ai-stack.service=n8n"
+      - "ai-stack.type=workflow"
+  
+  ollama_data:
+    labels:
+      - "ai-stack.service=ollama"
+      - "ai-stack.type=ai-models"
+  
+  postgres_data:
+    labels:
+      - "ai-stack.service=postgres"
+      - "ai-stack.type=database"
+  
+  redis_data:
+    labels:
+      - "ai-stack.service=redis"
+      - "ai-stack.type=cache"
+  
+  webui_data:
+    labels:
+      - "ai-stack.service=webui"
+      - "ai-stack.type=application"
