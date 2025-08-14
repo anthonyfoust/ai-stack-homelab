@@ -11,15 +11,33 @@ backups/
 # Temporary files
 *.tmp
 *.log
+
+# macOS system files
 .DS_Store
+*/.DS_Store
+**/.DS_Store
 
 # IDE files
 .vscode/
 .idea/
 
-# Docker overrides (keep template)
+# Docker overrides
 docker-compose.override.yml
 
 # Backup files
 *.backup
 *.sql.gz
+*.enc
+
+# Node modules (if any)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# System files
+Thumbs.db
+
+# Git directories
+.git/
