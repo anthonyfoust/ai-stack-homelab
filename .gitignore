@@ -16,6 +16,7 @@ backups/
 # IDE files
 .vscode/
 .idea/
+*.code-workspace
 
 # Docker overrides
 docker-compose.override.yml
