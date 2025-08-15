@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "n8n-mcp",
+        "http://n8n-mcp:3000/mcp",
+        "--header",
+        "Authorization: Bearer ${N8N_MCP_AUTH_TOKEN}",
+        "--allow-http"
+      ],
+      "env": {
+        "NODE_ENV": "production",
+        "LOG_LEVEL": "error"
+      }
+    }
+  },
+  "logging": {
+    "level": "info",
+    "destination": "/tmp/mcpo.log"
+  },
+  "security": {
+    "enableAuth": true,
+    "allowHttp": true,
+    "corsEnabled": true,
+    "corsOrigins": ["http://localhost:8080", "http://localhost:5678"]
+  },
+  "rateLimit": {
+    "enabled": true,
+    "windowMs": 60000,
+    "maxRequests": 100
+  }
+}

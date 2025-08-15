@@ -1,0 +1,36 @@
+# Environment files with secrets
+.env
+.env.local
+.env.production
+
+# Data directories
+data/
+logs/
+backups/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+
+# Docker overrides
+docker-compose.override.yml
+
+# Backup files
+*.backup
+*.sql.gz
+*.enc
+
+# Node modules (if any)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# System files
+Thumbs.db
